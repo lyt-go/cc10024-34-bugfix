@@ -1,11 +1,16 @@
 """运行历史领域服务：采集运行记录的统一查询和审计，消费behavior_script/batch_queue/error_recover写入的运行数据。
-当run_history.confirmed_run触发时自动执行page_dedup和schema_check。"""
+当run_history.confirmed_run触发时自动执行page_dedup和schema_check。
+
+对错误恢复的重采运行，本模块消费 :mod:`app.services.recollect_counts` 的计数记录：
+尝试次数与实际失败的采集页数分别保存；未确认采集数据时失败页数为未知，不落暂存行数。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from app.store import store
 from app.services.base import BaseModuleService, register_hook
+from app.services import recollect_counts
 from app import persistence as persist
 
 
@@ -53,11 +58,25 @@ class RunHistoryService(BaseModuleService):
     MODULE = "run_history"
     ENTITY = "运行记录"
     OPERATION_TERM = "查询"
-    LIST_FIELDS = ["记录编号", "关联计划", "开始时间", "结束时间", "采集行数", "失败行数", "执行日志", "异常摘要"]
+    LIST_FIELDS = ["记录编号", "关联计划", "开始时间", "结束时间", "尝试次数", "采集行数", "失败行数", "成功页数", "失败页数", "执行日志", "异常摘要"]
     REQUIRED_FIELDS = ["记录编号", "关联计划", "开始时间"]
     STATUS_ORDER = ["运行中", "已完成", "部分成功", "已失败"]
     ACTION_RULES = {"确认完成": "已完成", "标记部分完成": "部分成功", "标记失败": "已失败"}
     NEGATIVE_ACTIONS = []
+
+    def recollect_counts(self, entry_id: int) -> dict[str, Any] | None:
+        """取本运行记录对应的重采计数记录（尝试次数/失败页数分开保存）。"""
+        row = store.find(self.MODULE, entry_id)
+        record = recollect_counts.get_run_by_history_id(entry_id)
+        if record is None and row is not None:
+            task_id = row.get("恢复任务ID")
+            if task_id is not None:
+                record = recollect_counts.latest_run_for_task(int(task_id))
+        return record
+
+    def unconfirmed_recollects(self) -> list[dict[str, Any]]:
+        """采集数据仍未确认（尚无真实回执）的运行。"""
+        return recollect_counts.unconfirmed_records()
 
     def get_recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         """获取最近的运行记录，优先从JSONL文件读取完整历史。"""
@@ -90,4 +109,11 @@ class RunHistoryService(BaseModuleService):
         # 关联的schema校验报告
         schema_reports = persist.read_jsonl("reports", "schema_check_report.jsonl")
         base["triggered_schema"] = len([r for r in schema_reports if r.get("trigger") == "run_history_confirm"])
+        # 重采运行计数：尝试次数与失败页数分开统计
+        counters = recollect_counts.records()
+        base["recollect_runs"] = len(counters)
+        base["recollect_attempts"] = sum(int(c.get("attempts", 0)) for c in counters)
+        base["recollect_failed_pages"] = sum(
+            int(c["failed_pages"]) for c in counters if c.get("failed_pages") is not None)
+        base["recollect_unconfirmed"] = len(recollect_counts.unconfirmed_records())
         return base

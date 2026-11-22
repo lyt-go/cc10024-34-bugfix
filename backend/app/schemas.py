@@ -29,3 +29,12 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class AttemptPayload(BaseModel):
+    count: int = 1
+
+
+class ReceiptPayload(BaseModel):
+    page_key: str
+    success: bool = True

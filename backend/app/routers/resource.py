@@ -8,7 +8,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    AttemptPayload,
+    EntryPayload,
+    PageResult,
+    ReceiptPayload,
+)
 from app.services import service_for
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -96,3 +103,42 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/error_recover/{entry_id}/attempts", response_model=ActionResult)
+def register_attempts(entry_id: int, payload: AttemptPayload) -> ActionResult:
+    """登记重采尝试次数：只记尝试，不写失败页数。"""
+    from app.services.error_recover import ErrorRecoverService
+
+    service = require_service("error_recover")
+    assert isinstance(service, ErrorRecoverService)
+    record = service.register_attempts(entry_id, payload.count)
+    if record is None:
+        return ActionResult(ok=False, message=f"恢复任务 {entry_id} 不存在或已归档")
+    return ActionResult(ok=True, message="尝试次数已登记", entry=record)
+
+
+@router.post("/error_recover/{entry_id}/receipts", response_model=ActionResult)
+def record_receipt(entry_id: int, payload: ReceiptPayload) -> ActionResult:
+    """登记采集页回执：成功/失败按页去重，最终统计只依据真实回执。"""
+    from app.services.error_recover import ErrorRecoverService
+
+    service = require_service("error_recover")
+    assert isinstance(service, ErrorRecoverService)
+    record = service.record_receipt(entry_id, payload.page_key, payload.success)
+    if record is None:
+        return ActionResult(ok=False, message=f"恢复任务 {entry_id} 不存在或已归档")
+    return ActionResult(ok=True, message="采集回执已登记", entry=record)
+
+
+@router.get("/run_history/{entry_id}/recollect")
+def recollect_count(entry_id: int) -> dict[str, Any]:
+    """运行历史详情：尝试次数与实际失败页数分开返回，未确认时失败页数为 null。"""
+    from app.services.run_history import RunHistoryService
+
+    service = require_service("run_history")
+    assert isinstance(service, RunHistoryService)
+    record = service.recollect_counts(entry_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {entry_id} 没有重采计数记录")
+    return record
